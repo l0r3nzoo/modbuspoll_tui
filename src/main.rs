@@ -753,6 +753,13 @@ fn draw_conn_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
                         Span::styled(&app.status, Style::new().fg(status_color).bold()),
                         Span::raw(" "),
                     ]))
+                    .title_top(
+                        Line::from(Span::styled(
+                            "lorenbhanu (lorenbhanu@proton.me)",
+                            Style::new().fg(Color::Green).bold(),
+                        ))
+                        .right_aligned(),
+                    )
                     .border_type(BorderType::Rounded)
                     .border_style(Style::new().cyan()),
             ),
