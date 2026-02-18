@@ -22,11 +22,10 @@ use tokio_modbus::slave::SlaveContext;
 /// Commands sent from TUI → worker
 #[derive(Debug)]
 enum PollCommand {
-    /// New poll request with current settings
     Poll {
         slave_id: u8,
         reg_type: RegTypeKind,
-        address: u16, // 0-based protocol address
+        address: u16,
         count: u16,
     },
     Shutdown,
@@ -49,6 +48,53 @@ enum RegTypeKind {
     Discrete,
     Holding,
     Input,
+}
+
+// ── CRC16 Modbus ──────────────────────────────────────────────────────────────
+
+/// Compute Modbus RTU CRC16.
+/// Returns CRC as u16 — low byte first per Modbus RTU spec.
+fn crc16_modbus(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in data {
+        crc ^= byte as u16;
+        for _ in 0..8 {
+            if crc & 0x0001 != 0 {
+                crc >>= 1;
+                crc ^= 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    crc
+}
+
+/// Build a Modbus RTU frame: [slave_id] + pdu + [crc_lo, crc_hi]
+fn build_rtu_frame(slave_id: u8, pdu: &[u8]) -> Vec<u8> {
+    let mut frame = vec![slave_id];
+    frame.extend_from_slice(pdu);
+    let crc = crc16_modbus(&frame);
+    frame.push((crc & 0xFF) as u8); // CRC low byte first
+    frame.push((crc >> 8) as u8); // CRC high byte second
+    frame
+}
+
+/// Build a Modbus TCP frame: MBAP header + PDU
+/// MBAP: TransactionID(2) + ProtocolID(2) + Length(2) + UnitID(1)
+fn build_tcp_frame(slave_id: u8, pdu: &[u8], transaction_id: u16) -> Vec<u8> {
+    let length = (1 + pdu.len()) as u16; // UnitID(1) + PDU
+    let mut frame = vec![
+        (transaction_id >> 8) as u8,
+        (transaction_id & 0xFF) as u8,
+        0x00,
+        0x00, // Protocol ID always 0
+        (length >> 8) as u8,
+        (length & 0xFF) as u8,
+        slave_id, // Unit ID
+    ];
+    frame.extend_from_slice(pdu);
+    frame
 }
 
 // ── Modbus worker (runs inside tokio) ────────────────────────────────────────
@@ -76,6 +122,8 @@ async fn run_modbus_tcp(
         }
     };
 
+    let mut transaction_id: u16 = 0;
+
     for cmd in cmd_rx {
         match cmd {
             PollCommand::Shutdown => break,
@@ -86,7 +134,17 @@ async fn run_modbus_tcp(
                 count,
             } => {
                 ctx.set_slave(Slave(slave_id));
-                let result = do_poll(&mut ctx, reg_type, address, count).await;
+                transaction_id = transaction_id.wrapping_add(1);
+                let result = do_poll(
+                    &mut ctx,
+                    reg_type,
+                    address,
+                    count,
+                    slave_id,
+                    false,
+                    transaction_id,
+                )
+                .await;
                 let _ = res_tx.send(result);
             }
         }
@@ -135,6 +193,7 @@ async fn run_modbus_rtu(
     };
 
     let mut ctx = rtu::attach_slave(port, Slave(1));
+
     for cmd in cmd_rx {
         match cmd {
             PollCommand::Shutdown => break,
@@ -145,7 +204,11 @@ async fn run_modbus_rtu(
                 count,
             } => {
                 ctx.set_slave(Slave(slave_id));
-                let result = do_poll(&mut ctx, reg_type, address, count).await;
+                let result = do_poll(
+                    &mut ctx, reg_type, address, count, slave_id, true,
+                    0, // transaction_id unused for RTU
+                )
+                .await;
                 let _ = res_tx.send(result);
             }
         }
@@ -157,16 +220,20 @@ async fn do_poll(
     reg_type: RegTypeKind,
     address: u16,
     count: u16,
+    slave_id: u8,
+    use_rtu: bool,
+    transaction_id: u16,
 ) -> PollResult {
-    // Build raw TX frame for display (simplified ADU)
     let fc: u8 = match reg_type {
         RegTypeKind::Coil => 0x01,
         RegTypeKind::Discrete => 0x02,
         RegTypeKind::Holding => 0x03,
         RegTypeKind::Input => 0x04,
     };
-    let tx_frame = vec![
-        0x00,
+
+    // ── Build real TX frame ──────────────────────────────────────────────────
+    // PDU = FC + StartAddr(2) + Quantity(2)
+    let req_pdu = vec![
         fc,
         (address >> 8) as u8,
         address as u8,
@@ -174,6 +241,13 @@ async fn do_poll(
         count as u8,
     ];
 
+    let tx_frame = if use_rtu {
+        build_rtu_frame(slave_id, &req_pdu)
+    } else {
+        build_tcp_frame(slave_id, &req_pdu, transaction_id)
+    };
+
+    // ── Execute Modbus request ───────────────────────────────────────────────
     let result: Result<Vec<u16>, Box<dyn std::error::Error>> = match reg_type {
         RegTypeKind::Coil => match ctx.read_coils(address, count).await {
             Ok(Ok(v)) => Ok(v.iter().map(|b| *b as u16).collect()),
@@ -199,12 +273,21 @@ async fn do_poll(
 
     match result {
         Ok(registers) => {
-            // Build simplified RX frame
-            let mut rx_frame = vec![0x00, fc, (registers.len() * 2) as u8];
+            // ── Build real RX frame ──────────────────────────────────────────
+            // Response PDU = FC + ByteCount + Data
+            let byte_count = (registers.len() * 2) as u8;
+            let mut resp_pdu = vec![fc, byte_count];
             for r in &registers {
-                rx_frame.push((r >> 8) as u8);
-                rx_frame.push(*r as u8);
+                resp_pdu.push((r >> 8) as u8);
+                resp_pdu.push(*r as u8);
             }
+
+            let rx_frame = if use_rtu {
+                build_rtu_frame(slave_id, &resp_pdu)
+            } else {
+                build_tcp_frame(slave_id, &resp_pdu, transaction_id)
+            };
+
             PollResult::Data {
                 registers,
                 tx_frame,
@@ -313,7 +396,6 @@ impl RegType {
         }
     }
 
-    /// The thousands-digit prefix shown in the display address
     fn prefix(self) -> u32 {
         match self {
             RegType::Coil => 0,
@@ -323,12 +405,10 @@ impl RegType {
         }
     }
 
-    /// Display address = prefix * 10000 + suffix + 1  (1-based)
     fn display_address(self, suffix: u16) -> u32 {
         self.prefix() * 10_000 + suffix as u32 + 1
     }
 
-    /// Protocol address = suffix (0-based)
     fn protocol_address(suffix: u16) -> u16 {
         suffix
     }
@@ -378,9 +458,9 @@ struct TrafficFrame {
 
 struct App {
     conn: String,
+    is_rtu: bool, // true = RTU, false = TCP — drives frame formatting labels
 
     reg_type_idx: usize,
-    /// Suffix only (0-based), user types this
     address_suffix: String,
     length: String,
     slave: String,
@@ -403,13 +483,15 @@ struct App {
 impl App {
     fn new(
         conn: ConnectionInfo,
+        is_rtu: bool,
         cmd_tx: mpsc::SyncSender<PollCommand>,
         res_rx: mpsc::Receiver<PollResult>,
     ) -> Self {
         Self {
             conn: conn.mode_label,
-            reg_type_idx: 2,            // Holding default
-            address_suffix: "0".into(), // suffix 0 → display 40001
+            is_rtu,
+            reg_type_idx: 2,
+            address_suffix: "0".into(),
             length: "10".into(),
             slave: "1".into(),
             interval_ms: "1000".into(),
@@ -656,6 +738,8 @@ fn focused_block(title: &str, focused: bool) -> Block {
 fn draw_conn_bar(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let status_color = if app.status.starts_with("Error") {
         Color::Red
+    } else if app.status.starts_with("Connecting") {
+        Color::Yellow
     } else {
         Color::Green
     };
@@ -699,14 +783,12 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App, area: Rect) {
         cols[0],
     );
 
-    // Address — user types suffix, we show full display address
+    // Address
     let addr_focused = app.focus == Focus::Address;
     let display_addr = app.display_address();
-    // Show prefix dimmed + suffix bright so user knows what they're editing
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                // Show the full address, highlight suffix part
                 format!("{}", display_addr),
                 if addr_focused {
                     Style::new().black().on_cyan().bold()
@@ -843,7 +925,8 @@ fn draw_panels(f: &mut ratatui::Frame, app: &App, area: Rect) {
         left,
     );
 
-    // Traffic
+    // ── Traffic panel ────────────────────────────────────────────────────────
+    // Label the last two bytes as CRC (RTU) or show MBAP breakdown (TCP)
     let items: Vec<ListItem> = app
         .traffic
         .iter()
@@ -853,17 +936,23 @@ fn draw_panels(f: &mut ratatui::Frame, app: &App, area: Rect) {
             } else {
                 (Color::Green, "RX ◀")
             };
-            let hex: String = fr
-                .bytes
-                .iter()
-                .map(|b| format!("{:02X}", b))
-                .collect::<Vec<_>>()
-                .join(" ");
-            ListItem::new(Line::from(vec![
+
+            let bytes = &fr.bytes;
+            let hex_parts: Vec<Span> = if app.is_rtu {
+                // RTU: [SlaveID] [PDU bytes...] [CRC_LO CRC_HI]
+                annotate_rtu_frame(bytes, color)
+            } else {
+                // TCP: [TxnID(2)] [Proto(2)] [Len(2)] [UnitID] [PDU...]
+                annotate_tcp_frame(bytes, color)
+            };
+
+            let mut spans = vec![
                 Span::styled(format!("#{:<4} ", fr.seq), Style::new().dark_gray()),
                 Span::styled(format!("{} ", dir), Style::new().fg(color).bold()),
-                Span::styled(hex, Style::new().fg(color)),
-            ]))
+            ];
+            spans.extend(hex_parts);
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -873,16 +962,119 @@ fn draw_panels(f: &mut ratatui::Frame, app: &App, area: Rect) {
         state.select(Some(app.traffic_scroll.min(total - 1)));
     }
 
+    let proto_label = if app.is_rtu { "RTU" } else { "TCP" };
+
     f.render_stateful_widget(
         List::new(items).block(
             Block::bordered()
-                .title(format!(" Traffic  ─  {} frames ", total))
+                .title(format!(" Traffic [{}]  ─  {} frames ", proto_label, total))
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().magenta()),
         ),
         right,
         &mut state,
     );
+}
+
+/// Annotate RTU frame bytes with colour hints:
+///   byte 0         → slave id  (bright white)
+///   bytes 1..n-2   → PDU       (frame colour)
+///   bytes n-1, n   → CRC       (dim/italic)
+fn annotate_rtu_frame(bytes: &[u8], color: Color) -> Vec<Span<'static>> {
+    if bytes.is_empty() {
+        return vec![];
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // Slave ID
+    spans.push(Span::styled(
+        format!("{:02X}", bytes[0]),
+        Style::new().fg(Color::White).bold(),
+    ));
+    spans.push(Span::raw("|"));
+
+    // PDU (everything except slave + 2 CRC bytes)
+    let pdu_end = bytes.len().saturating_sub(2);
+    for b in &bytes[1..pdu_end] {
+        spans.push(Span::styled(format!(" {:02X}", b), Style::new().fg(color)));
+    }
+
+    // CRC
+    if bytes.len() >= 2 {
+        let crc_lo = bytes[bytes.len() - 2];
+        let crc_hi = bytes[bytes.len() - 1];
+        spans.push(Span::raw("|"));
+        spans.push(Span::styled(
+            format!(" {:02X} {:02X}", crc_lo, crc_hi),
+            Style::new().fg(Color::DarkGray).italic(),
+        ));
+        // Verify CRC and show ✓ / ✗
+        let computed = crc16_modbus(&bytes[..pdu_end]);
+        let received = (crc_lo as u16) | ((crc_hi as u16) << 8);
+        let ok = computed == received;
+        spans.push(Span::styled(
+            if ok { " ✓" } else { " ✗" },
+            Style::new()
+                .fg(if ok { Color::Green } else { Color::Red })
+                .bold(),
+        ));
+    }
+
+    spans
+}
+
+/// Annotate TCP/MBAP frame bytes:
+///   bytes 0-1  → Transaction ID  (dim)
+///   bytes 2-3  → Protocol ID     (dim)
+///   bytes 4-5  → Length          (dim)
+///   byte  6    → Unit ID         (bright)
+///   rest       → PDU             (frame colour)
+fn annotate_tcp_frame(bytes: &[u8], color: Color) -> Vec<Span<'static>> {
+    if bytes.len() < 7 {
+        // Too short — just dump raw hex
+        return bytes
+            .iter()
+            .map(|b| Span::styled(format!("{:02X} ", b), Style::new().fg(color)))
+            .collect();
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    // Transaction ID
+    spans.push(Span::styled(
+        format!("{:02X}{:02X}", bytes[0], bytes[1]),
+        Style::new().fg(Color::DarkGray),
+    ));
+    spans.push(Span::raw("|"));
+
+    // Protocol ID
+    spans.push(Span::styled(
+        format!("{:02X}{:02X}", bytes[2], bytes[3]),
+        Style::new().fg(Color::DarkGray),
+    ));
+    spans.push(Span::raw("|"));
+
+    // Length
+    spans.push(Span::styled(
+        format!("{:02X}{:02X}", bytes[4], bytes[5]),
+        Style::new().fg(Color::DarkGray),
+    ));
+    spans.push(Span::raw("|"));
+
+    // Unit ID
+    spans.push(Span::styled(
+        format!("{:02X}", bytes[6]),
+        Style::new().fg(Color::White).bold(),
+    ));
+    spans.push(Span::raw("|"));
+
+    // PDU
+    for b in &bytes[7..] {
+        spans.push(Span::styled(format!(" {:02X}", b), Style::new().fg(color)));
+    }
+
+    spans
 }
 
 fn draw_help(f: &mut ratatui::Frame, area: Rect) {
@@ -897,7 +1089,12 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
             Span::styled(" Space ", Style::new().black().on_dark_gray()),
             Span::raw(" poll now  "),
             Span::styled(" q ", Style::new().black().on_red()),
-            Span::raw(" quit"),
+            Span::raw(" quit  "),
+            Span::styled(" RTU: SlaveID|PDU|CRC✓ ", Style::new().dark_gray()),
+            Span::styled(
+                " TCP: TxnID|Proto|Len|UnitID|PDU ",
+                Style::new().dark_gray(),
+            ),
         ]))
         .alignment(Alignment::Center),
         area,
@@ -952,6 +1149,8 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let conn = ConnectionInfo::from_mode(&cli.mode);
 
+    let is_rtu = matches!(cli.mode, Mode::Rtu { .. });
+
     // Channels: bounded so we don't queue stale polls
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PollCommand>(1);
     let (res_tx, res_rx) = mpsc::channel::<PollResult>();
@@ -987,15 +1186,12 @@ fn main() -> anyhow::Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut app = App::new(conn, cmd_tx.clone(), res_rx);
+    let mut app = App::new(conn, is_rtu, cmd_tx.clone(), res_rx);
 
     loop {
-        // Drain any modbus results that arrived
         app.drain_results();
-
         terminal.draw(|f| draw(f, &app))?;
 
-        // Auto poll on interval
         if app.last_poll.elapsed() >= app.interval() {
             app.send_poll();
             app.last_poll = Instant::now();
