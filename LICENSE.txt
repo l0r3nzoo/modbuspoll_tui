@@ -1,0 +1,15 @@
+Copyright (c) 2026 Loren Bhanu. All Rights Reserved.
+
+This software and its source code are proprietary and confidential.
+
+You may NOT:
+  - Copy, modify, or distribute this software
+  - Use this software for commercial purposes without a license
+  - Reverse engineer or decompile this software
+  - Sublicense or sell copies of this software
+
+For licensing and purchasing inquiries contact:
+  lorenbhanu@proton.me
+
+Unauthorized use of this software is a violation of copyright law
+and may result in legal action.
