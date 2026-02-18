@@ -976,105 +976,23 @@ fn draw_panels(f: &mut ratatui::Frame, app: &App, area: Rect) {
     );
 }
 
-/// Annotate RTU frame bytes with colour hints:
-///   byte 0         → slave id  (bright white)
-///   bytes 1..n-2   → PDU       (frame colour)
-///   bytes n-1, n   → CRC       (dim/italic)
 fn annotate_rtu_frame(bytes: &[u8], color: Color) -> Vec<Span<'static>> {
-    if bytes.is_empty() {
-        return vec![];
-    }
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-
-    // Slave ID
-    spans.push(Span::styled(
-        format!("{:02X}", bytes[0]),
-        Style::new().fg(Color::White).bold(),
-    ));
-    spans.push(Span::raw("|"));
-
-    // PDU (everything except slave + 2 CRC bytes)
-    let pdu_end = bytes.len().saturating_sub(2);
-    for b in &bytes[1..pdu_end] {
-        spans.push(Span::styled(format!(" {:02X}", b), Style::new().fg(color)));
-    }
-
-    // CRC
-    if bytes.len() >= 2 {
-        let crc_lo = bytes[bytes.len() - 2];
-        let crc_hi = bytes[bytes.len() - 1];
-        spans.push(Span::raw("|"));
-        spans.push(Span::styled(
-            format!(" {:02X} {:02X}", crc_lo, crc_hi),
-            Style::new().fg(Color::DarkGray).italic(),
-        ));
-        // Verify CRC and show ✓ / ✗
-        let computed = crc16_modbus(&bytes[..pdu_end]);
-        let received = (crc_lo as u16) | ((crc_hi as u16) << 8);
-        let ok = computed == received;
-        spans.push(Span::styled(
-            if ok { " ✓" } else { " ✗" },
-            Style::new()
-                .fg(if ok { Color::Green } else { Color::Red })
-                .bold(),
-        ));
-    }
-
-    spans
+    let hex = bytes
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec![Span::styled(hex, Style::new().fg(color))]
 }
 
-/// Annotate TCP/MBAP frame bytes:
-///   bytes 0-1  → Transaction ID  (dim)
-///   bytes 2-3  → Protocol ID     (dim)
-///   bytes 4-5  → Length          (dim)
-///   byte  6    → Unit ID         (bright)
-///   rest       → PDU             (frame colour)
+/// Plain hex dump for TCP: all bytes space-separated.
 fn annotate_tcp_frame(bytes: &[u8], color: Color) -> Vec<Span<'static>> {
-    if bytes.len() < 7 {
-        // Too short — just dump raw hex
-        return bytes
-            .iter()
-            .map(|b| Span::styled(format!("{:02X} ", b), Style::new().fg(color)))
-            .collect();
-    }
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-
-    // Transaction ID
-    spans.push(Span::styled(
-        format!("{:02X}{:02X}", bytes[0], bytes[1]),
-        Style::new().fg(Color::DarkGray),
-    ));
-    spans.push(Span::raw("|"));
-
-    // Protocol ID
-    spans.push(Span::styled(
-        format!("{:02X}{:02X}", bytes[2], bytes[3]),
-        Style::new().fg(Color::DarkGray),
-    ));
-    spans.push(Span::raw("|"));
-
-    // Length
-    spans.push(Span::styled(
-        format!("{:02X}{:02X}", bytes[4], bytes[5]),
-        Style::new().fg(Color::DarkGray),
-    ));
-    spans.push(Span::raw("|"));
-
-    // Unit ID
-    spans.push(Span::styled(
-        format!("{:02X}", bytes[6]),
-        Style::new().fg(Color::White).bold(),
-    ));
-    spans.push(Span::raw("|"));
-
-    // PDU
-    for b in &bytes[7..] {
-        spans.push(Span::styled(format!(" {:02X}", b), Style::new().fg(color)));
-    }
-
-    spans
+    let hex = bytes
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec![Span::styled(hex, Style::new().fg(color))]
 }
 
 fn draw_help(f: &mut ratatui::Frame, area: Rect) {
