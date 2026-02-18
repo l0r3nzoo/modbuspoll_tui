@@ -32,9 +32,9 @@ pub enum Mode {
     },
 }
 
-/// Flattened connection info passed into the TUI
+/// Flattened connection info for the TUI title bar
 pub struct ConnectionInfo {
-    pub mode_label: String, // e.g. "RTU  COM3 @ 9600" or "TCP  192.168.1.1:502"
+    pub mode_label: String,
 }
 
 impl ConnectionInfo {

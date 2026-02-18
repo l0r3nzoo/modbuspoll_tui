@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-clap      = { version = "4", features = ["derive"] }
-ratatui   = "0.29"
-crossterm = "0.28"
-anyhow    = "1"
+clap        = { version = "4",    features = ["derive"] }
+ratatui     = "0.29"
+crossterm   = "0.28"
+anyhow      = "1"
+tokio       = { version = "1",    features = ["full"] }
+tokio-modbus = { version = "0.15", features = ["rtu", "tcp"] }
+tokio-serial = "5"
